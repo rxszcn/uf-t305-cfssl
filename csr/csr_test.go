@@ -1047,3 +1047,160 @@ func TestDelegationCSR(t *testing.T) {
 		t.Fatal("generated csr has no extension")
 	}
 }
+
+// extensionOIDs returns the OIDs of the extensions carried by a CSR,
+// in list order.
+func extensionOIDs(t *testing.T, csrPEM []byte) []string {
+	t.Helper()
+	block, _ := pem.Decode(csrPEM)
+	if block == nil {
+		t.Fatal("failed to decode CSR PEM")
+	}
+	res, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		t.Fatalf("spat out nonsense as a csr: %v", err)
+	}
+	var oids []string
+	for _, ext := range res.Extensions {
+		oids = append(oids, ext.Id.String())
+	}
+	return oids
+}
+
+// hasExtension reports whether the CSR carries an extension with the
+// given OID, and whether that extension is critical.
+func hasExtension(t *testing.T, csrPEM []byte, oid asn1.ObjectIdentifier) (present, critical bool) {
+	t.Helper()
+	block, _ := pem.Decode(csrPEM)
+	if block == nil {
+		t.Fatal("failed to decode CSR PEM")
+	}
+	res, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		t.Fatalf("spat out nonsense as a csr: %v", err)
+	}
+	for _, ext := range res.Extensions {
+		if ext.Id.Equal(oid) {
+			return true, ext.Critical
+		}
+	}
+	return false, false
+}
+
+var basicConstraintsOID = asn1.ObjectIdentifier{2, 5, 29, 19}
+
+// TestCAOnlyCSRHasCriticalBasicConstraints is the "CA declaration only"
+// construction group: a request carrying a CA declaration must produce
+// a CSR whose extension list contains a critical BasicConstraints
+// extension.
+func TestCAOnlyCSRHasCriticalBasicConstraints(t *testing.T) {
+	cr := &CertificateRequest{
+		CN:         "ca-only.example.com",
+		CA:         &CAConfig{PathLength: 1},
+		KeyRequest: NewKeyRequest(),
+	}
+	csrPEM, _, err := ParseRequest(cr)
+	if err != nil {
+		t.Fatalf("could not generate csr: %v", err)
+	}
+	present, critical := hasExtension(t, csrPEM, basicConstraintsOID)
+	if !present {
+		t.Fatalf("CSR extension list %v lacks BasicConstraints", extensionOIDs(t, csrPEM))
+	}
+	if !critical {
+		t.Fatal("BasicConstraints extension is not marked critical")
+	}
+}
+
+// TestDelegationOnlyCSRHasDelegationExtension is the "delegation switch
+// only" construction group: a request with only the delegation switch
+// on must produce a CSR carrying exactly the delegation extension, with
+// no BasicConstraints. This is the pre-existing normal reading and must
+// keep passing unchanged.
+func TestDelegationOnlyCSRHasDelegationExtension(t *testing.T) {
+	cr := &CertificateRequest{
+		CN:                "delegation-only.example.com",
+		DelegationEnabled: true,
+		KeyRequest:        NewKeyRequest(),
+	}
+	csrPEM, _, err := ParseRequest(cr)
+	if err != nil {
+		t.Fatalf("could not generate csr: %v", err)
+	}
+	present, _ := hasExtension(t, csrPEM, helpers.DelegationUsage)
+	if !present {
+		t.Fatalf("CSR extension list %v lacks the delegation extension", extensionOIDs(t, csrPEM))
+	}
+	if present, _ := hasExtension(t, csrPEM, basicConstraintsOID); present {
+		t.Fatal("delegation-only CSR unexpectedly carries BasicConstraints")
+	}
+}
+
+// TestCADelegationCSRHasBothExtensions is the "CA declaration plus
+// delegation switch" construction group: both the critical
+// BasicConstraints extension and the delegation extension must be
+// present in the CSR extension list at the same time.
+func TestCADelegationCSRHasBothExtensions(t *testing.T) {
+	cr := &CertificateRequest{
+		CN:                "ca-delegation.example.com",
+		CA:                &CAConfig{PathLength: 0, PathLenZero: true},
+		DelegationEnabled: true,
+		KeyRequest:        NewKeyRequest(),
+	}
+	csrPEM, _, err := ParseRequest(cr)
+	if err != nil {
+		t.Fatalf("could not generate csr: %v", err)
+	}
+	present, critical := hasExtension(t, csrPEM, basicConstraintsOID)
+	if !present {
+		t.Fatalf("CA+delegation CSR extension list %v lacks BasicConstraints", extensionOIDs(t, csrPEM))
+	}
+	if !critical {
+		t.Fatal("BasicConstraints extension is not marked critical")
+	}
+	if present, _ := hasExtension(t, csrPEM, helpers.DelegationUsage); !present {
+		t.Fatalf("CA+delegation CSR extension list %v lacks the delegation extension", extensionOIDs(t, csrPEM))
+	}
+}
+
+// TestCADelegationCustomExtensionsCSR is the triple-stacked
+// construction group (CA declaration + delegation switch + user-defined
+// extensions): every user-defined extension must be passed through one
+// by one, and the BasicConstraints and delegation extensions assembled
+// earlier must remain in the extension list.
+func TestCADelegationCustomExtensionsCSR(t *testing.T) {
+	custom := []pkix.Extension{
+		{Id: asn1.ObjectIdentifier{1, 2, 3, 4, 5}, Value: []byte{0x05, 0x00}},
+		{Id: asn1.ObjectIdentifier{1, 2, 3, 4, 6}, Critical: true, Value: []byte{0x05, 0x00}},
+	}
+	cr := &CertificateRequest{
+		CN:                "triple-stack.example.com",
+		CA:                &CAConfig{PathLength: 2},
+		DelegationEnabled: true,
+		Extensions:        custom,
+		KeyRequest:        NewKeyRequest(),
+	}
+	csrPEM, _, err := ParseRequest(cr)
+	if err != nil {
+		t.Fatalf("could not generate csr: %v", err)
+	}
+	for _, want := range custom {
+		present, critical := hasExtension(t, csrPEM, want.Id)
+		if !present {
+			t.Fatalf("triple-stacked CSR extension list %v lacks user extension %s", extensionOIDs(t, csrPEM), want.Id)
+		}
+		if critical != want.Critical {
+			t.Fatalf("user extension %s critical flag: got %v, want %v", want.Id, critical, want.Critical)
+		}
+	}
+	present, critical := hasExtension(t, csrPEM, basicConstraintsOID)
+	if !present {
+		t.Fatalf("triple-stacked CSR extension list %v lacks BasicConstraints", extensionOIDs(t, csrPEM))
+	}
+	if !critical {
+		t.Fatal("BasicConstraints extension is not marked critical")
+	}
+	if present, _ := hasExtension(t, csrPEM, helpers.DelegationUsage); !present {
+		t.Fatalf("triple-stacked CSR extension list %v lacks the delegation extension", extensionOIDs(t, csrPEM))
+	}
+}

@@ -161,16 +161,31 @@ type CAConfig struct {
 
 // A CertificateRequest encapsulates the API interface to the
 // certificate request functionality.
+//
+// Extension assembly: the CA, DelegationEnabled and Extensions fields
+// each contribute extensions to the generated CSR, and their
+// contributions accumulate in the CSR's extension list in the order CA
+// (critical BasicConstraints), DelegationEnabled (delegation usage),
+// Extensions (user-defined). Enabling one field never removes or
+// replaces the extensions contributed by another.
 type CertificateRequest struct {
-	CN                string           `json:"CN" yaml:"CN"`
-	Names             []Name           `json:"names" yaml:"names"`
-	Hosts             []string         `json:"hosts" yaml:"hosts"`
-	KeyRequest        *KeyRequest      `json:"key,omitempty" yaml:"key,omitempty"`
-	CA                *CAConfig        `json:"ca,omitempty" yaml:"ca,omitempty"`
-	SerialNumber      string           `json:"serialnumber,omitempty" yaml:"serialnumber,omitempty"`
-	DelegationEnabled bool             `json:"delegation_enabled,omitempty" yaml:"delegation_enabled,omitempty"`
-	Extensions        []pkix.Extension `json:"extensions,omitempty" yaml:"extensions,omitempty"`
-	CRL               string           `json:"crl_url,omitempty" yaml:"crl_url,omitempty"`
+	CN         string      `json:"CN" yaml:"CN"`
+	Names      []Name      `json:"names" yaml:"names"`
+	Hosts      []string    `json:"hosts" yaml:"hosts"`
+	KeyRequest *KeyRequest `json:"key,omitempty" yaml:"key,omitempty"`
+	// CA, when non-nil, marks the request as a CA request: a critical
+	// BasicConstraints extension with IsCA=true is added to the CSR.
+	CA           *CAConfig `json:"ca,omitempty" yaml:"ca,omitempty"`
+	SerialNumber string    `json:"serialnumber,omitempty" yaml:"serialnumber,omitempty"`
+	// DelegationEnabled adds the delegation usage extension to the CSR.
+	// It is appended to the extension list alongside any CA
+	// BasicConstraints and user-defined extensions, not in their place.
+	DelegationEnabled bool `json:"delegation_enabled,omitempty" yaml:"delegation_enabled,omitempty"`
+	// Extensions holds user-defined extensions. They are passed through
+	// into the CSR one by one, in addition to — never instead of — the
+	// extensions contributed by CA and DelegationEnabled.
+	Extensions []pkix.Extension `json:"extensions,omitempty" yaml:"extensions,omitempty"`
+	CRL        string           `json:"crl_url,omitempty" yaml:"crl_url,omitempty"`
 
 	// RawSubject is a DER-encoded X.501 Name used verbatim as the CSR
 	// subject. It cannot be combined with CN, Names or SerialNumber. It can
@@ -531,7 +546,10 @@ func GenerateDER(priv crypto.Signer, req *CertificateRequest) (csr []byte, err e
 	}
 
 	if req.DelegationEnabled {
-		tpl.ExtraExtensions = append(tpl.Extensions, helpers.DelegationExtension)
+		// Append to ExtraExtensions (not tpl.Extensions): the delegation
+		// extension must accumulate with any extensions already assembled
+		// above (e.g. the CA BasicConstraints), never replace them.
+		tpl.ExtraExtensions = append(tpl.ExtraExtensions, helpers.DelegationExtension)
 	}
 
 	if req.Extensions != nil {
